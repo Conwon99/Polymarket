@@ -1,175 +1,97 @@
 """
-Polymarket Weather Niche Copytrade Finder
-Finds the best wallets to copytrade in Polymarket's weather prediction markets.
+Polymarket Weather Niche — Copytrade Leaderboard
+Finds wallets that correctly predicted the winning temperature range
+across multiple resolved weather events (Jun 23–27, 2026).
+
+Ranks by: correct predictions across most distinct city/date events.
+Excludes LP bots (present in every single market of an event).
 
 Usage:
     python weather_copytrade.py
-
-Outputs a ranked table of weather traders by net P&L, win rate, and market breadth.
 """
 
 import requests
 import time
+import json
 from collections import defaultdict
 
-BASE = "https://data-api.polymarket.com"
+BASE  = "https://data-api.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
 
-WEATHER_KEYWORDS = (
-    "temperature", "celsius", "fahrenheit", "rain", "snow",
-    "hurricane", "storm", "wind", "humidity", "weather",
-    "highest temp", "lowest temp", "°c", "°f",
-    "highest temperature", "degrees",
-)
-
-WEATHER_EVENT_SLUGS = [
-    "highest-temperature-in-london-on-june-23-2026",
-    "highest-temperature-in-paris-on-june-23-2026",
-    "highest-temperature-in-nyc-on-june-23-2026",
-    "highest-temperature-in-hong-kong-on-june-23-2026",
-    "highest-temperature-in-munich-on-june-23-2026",
-    "highest-temperature-in-madrid-on-june-23-2026",
-    "highest-temperature-in-amsterdam-on-june-23-2026",
-    "highest-temperature-in-istanbul-on-june-23-2026",
-    "highest-temperature-in-miami-on-june-23-2026",
-    "highest-temperature-in-los-angeles-on-june-23-2026",
-    "highest-temperature-in-atlanta-on-june-23-2026",
-    "highest-temperature-in-sao-paulo-on-june-23-2026",
-    "highest-temperature-in-helsinki-on-june-23-2026",
-    "highest-temperature-in-warsaw-on-june-23-2026",
-    "highest-temperature-in-ankara-on-june-23-2026",
-    "highest-temperature-in-moscow-on-june-23-2026",
-    "highest-temperature-in-jeddah-on-june-23-2026",
-    "highest-temperature-in-london-on-june-24-2026",
-    "highest-temperature-in-hong-kong-on-june-24-2026",
-    "highest-temperature-in-seoul-on-june-24-2026",
+CITIES = [
+    "london", "paris", "nyc", "hong-kong", "munich", "madrid",
+    "amsterdam", "istanbul", "miami", "los-angeles", "atlanta",
+    "sao-paulo", "helsinki", "warsaw", "ankara", "moscow", "jeddah",
+    "seoul", "tokyo", "singapore", "chicago", "toronto", "buenos-aires",
+    "dubai", "berlin",
 ]
 
-# Score only top N wallets by breadth — keeps runtime under 3 min
-TOP_N = 150
+PAST_DATES = [
+    "june-23-2026", "june-24-2026", "june-25-2026",
+    "june-26-2026", "june-27-2026",
+]
+
+MIN_CORRECT  = 3    # minimum correct predictions to appear in leaderboard
+TOP_RESULTS  = 20
+BOT_THRESHOLD = 15  # wallets present in ≥ this many markets of same event = LP bot
 
 
 def get(url, params=None, retries=3):
     for attempt in range(retries):
         try:
-            r = requests.get(url, params=params, timeout=10)
+            r = requests.get(url, params=params, timeout=12)
             r.raise_for_status()
             return r.json()
         except Exception:
-            if attempt == retries - 1:
-                return None
-            time.sleep(1.5 ** attempt)
+            if attempt < retries - 1:
+                time.sleep(1.5 ** attempt)
+    return None
 
 
-def is_weather_title(title: str) -> bool:
-    t = title.lower()
-    return any(kw in t for kw in WEATHER_KEYWORDS)
+def parse_prices(raw):
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return raw or []
 
 
-def get_condition_ids_for_events(slugs: list) -> list:
-    condition_ids = []
-    print(f"[+] Fetching condition IDs for {len(slugs)} weather events...")
-    for slug in slugs:
-        data = get(f"{GAMMA}/events", params={"slug": slug})
-        if not data:
-            continue
-        events = data if isinstance(data, list) else [data]
-        for event in events:
-            for m in event.get("markets", []):
+def find_winning_cids() -> list:
+    """For each closed weather event, return (event_title, winning_conditionId, total_markets_in_event)."""
+    results = []
+    print(f"[+] Scanning {len(CITIES) * len(PAST_DATES)} city/date combos for resolved weather events...")
+    for city in CITIES:
+        for date in PAST_DATES:
+            slug = f"highest-temperature-in-{city}-on-{date}"
+            data = get(f"{GAMMA}/events", params={"slug": slug})
+            if not data:
+                continue
+            ev = data[0] if isinstance(data, list) else data
+            if not ev.get("closed"):
+                continue
+            markets = ev.get("markets", [])
+            total = len(markets)
+            for m in markets:
+                op = parse_prices(m.get("outcomePrices"))
                 cid = m.get("conditionId")
-                if cid:
-                    condition_ids.append(cid)
-        time.sleep(0.1)
-    print(f"    Found {len(condition_ids)} condition IDs")
-    return condition_ids
+                if op and str(op[0]) == "1" and cid:
+                    results.append((ev["title"], cid, total))
+                    break   # only one winner per event
+            time.sleep(0.05)
+    print(f"    Found {len(results)} resolved winning markets")
+    return results
 
 
-def get_holders_flat(condition_id: str, limit: int = 50) -> list:
-    """Returns flat list of holder dicts for a conditionId.
-    API returns [{token, holders:[{proxyWallet,...}]}, ...] per YES/NO token.
-    """
-    data = get(f"{BASE}/holders", params={"market": condition_id, "limit": limit})
+def get_yes_holders(cid: str, limit: int = 200) -> list:
+    """Returns list of proxyWallet addresses that held YES in this market."""
+    data = get(f"{BASE}/holders", params={"market": cid, "limit": limit})
     if not data or not isinstance(data, list):
         return []
-    flat = []
-    for token_group in data:
-        for h in token_group.get("holders", []):
-            flat.append(h)
-    return flat
-
-
-def collect_weather_wallets(condition_ids: list) -> dict:
-    """Returns {wallet: market_count} sorted descending."""
-    wallet_count = defaultdict(int)
-    print(f"[+] Scanning {len(condition_ids)} markets for weather traders...")
-    for i, cid in enumerate(condition_ids):
-        seen = set()
-        for h in get_holders_flat(cid, limit=50):
-            w = (h.get("proxyWallet") or "").lower()
-            if w and w not in seen:
-                wallet_count[w] += 1
-                seen.add(w)
-        if (i + 1) % 20 == 0:
-            print(f"    {i+1}/{len(condition_ids)} markets scanned")
-        time.sleep(0.1)
-    return dict(sorted(wallet_count.items(), key=lambda x: -x[1]))
-
-
-def score_wallet(wallet: str) -> dict | None:
-    positions = get(
-        f"{BASE}/positions",
-        params={"user": wallet, "sizeThreshold": "0", "limit": "500"},
-    )
-    if not positions or not isinstance(positions, list):
-        return None
-
-    wp = [p for p in positions if is_weather_title(p.get("title", ""))]
-    if not wp:
-        return None
-
-    # Skip liquidity providers (many positions with identically huge values & 0% P&L)
-    vals = [float(p.get("currentValue", 0)) for p in wp]
-    if vals and max(vals) > 500_000:
-        return None
-
-    net_pnl = sum(float(p.get("cashPnl", 0)) for p in wp)
-    wins  = sum(1 for p in wp if float(p.get("cashPnl", 0)) > 0)
-    total = len(wp)
-    win_rate = wins / total if total else 0
-    initial = sum(abs(float(p.get("initialValue", 0))) for p in wp)
-    roi = (net_pnl / initial * 100) if initial > 0 else 0
-
-    # Largest single win gives signal of real knowledge
-    best_pnl = max((float(p.get("cashPnl", 0)) for p in wp), default=0)
-
-    name = ""
-    for p in wp:
-        n = p.get("name") or p.get("pseudonym") or ""
-        if n:
-            name = n
-            break
-
-    return {
-        "wallet": wallet,
-        "username": name,
-        "weather_markets": total,
-        "wins": wins,
-        "losses": total - wins,
-        "win_rate": round(win_rate * 100, 1),
-        "net_pnl": round(net_pnl, 2),
-        "total_wagered": round(initial, 2),
-        "roi_pct": round(roi, 2),
-        "best_single_pnl": round(best_pnl, 2),
-        "url": f"https://polymarket.com/profile/{wallet}",
-    }
-
-
-def composite(r: dict, breadth: int) -> float:
-    """Rank: reward profitable, wide, high-win-rate traders."""
-    wagered = r["total_wagered"] or 1
-    roi_norm = r["net_pnl"] / wagered
-    wr = r["win_rate"] / 100
-    return roi_norm * wr * breadth
+    # First token group = YES token
+    yes_group = data[0] if data else {}
+    return [
+        (h.get("proxyWallet") or "").lower()
+        for h in yes_group.get("holders", [])
+        if h.get("proxyWallet")
+    ]
 
 
 def main():
@@ -177,43 +99,71 @@ def main():
     print("  Polymarket Weather Niche — Copytrade Leaderboard")
     print("=" * 62)
 
-    condition_ids = get_condition_ids_for_events(WEATHER_EVENT_SLUGS)
-    wallet_counts = collect_weather_wallets(condition_ids)
+    winning_markets = find_winning_cids()
+    if not winning_markets:
+        print("No resolved weather markets found.")
+        return []
 
-    # Limit to top N by market breadth to keep runtime fast
-    top_wallets = list(wallet_counts.keys())[:TOP_N]
-    print(f"\n[+] Scoring top {len(top_wallets)} wallets by weather P&L...")
+    # wallet → set of event titles they correctly predicted
+    correct_events: dict[str, set] = defaultdict(set)
+    # wallet → number of total distinct markets they appear in (for bot detection)
+    market_count: dict[str, int] = defaultdict(int)
 
-    results = []
-    for i, wallet in enumerate(top_wallets):
-        score = score_wallet(wallet)
-        if score:
-            score["breadth"] = wallet_counts[wallet]
-            results.append(score)
-        if (i + 1) % 25 == 0:
-            print(f"    {i+1}/{len(top_wallets)} scored so far...")
-        time.sleep(0.12)
+    print(f"\n[+] Fetching YES holders for {len(winning_markets)} winning markets...")
+    for i, (event_title, cid, total_mkts) in enumerate(winning_markets):
+        holders = get_yes_holders(cid, limit=200)
+        for w in holders:
+            correct_events[w].add(event_title)
+            market_count[w] += 1
+        if (i + 1) % 20 == 0:
+            print(f"    {i+1}/{len(winning_markets)} markets processed...")
+        time.sleep(0.08)
 
-    results.sort(key=lambda r: composite(r, r["breadth"]), reverse=True)
+    # Build leaderboard
+    rows = []
+    for wallet, events in correct_events.items():
+        n_correct = len(events)
+        if n_correct < MIN_CORRECT:
+            continue
+        # Exclude LP bots: present in suspiciously many winning markets
+        if market_count[wallet] >= BOT_THRESHOLD:
+            continue
+        rows.append({
+            "wallet":   wallet,
+            "correct":  n_correct,
+            "url":      f"https://polymarket.com/profile/{wallet}",
+        })
 
-    top = results[:15]
-    hdr = f"{'#':<4} {'Username':<22} {'Wallet':<44} {'Mkt':>4} {'W/L':>7} {'WR%':>5} {'Net P&L':>10} {'ROI':>7}"
+    rows.sort(key=lambda r: r["correct"], reverse=True)
+    top = rows[:TOP_RESULTS]
+
+    # Enrich with usernames from activity API
+    print(f"\n[+] Enriching {len(top)} wallets with usernames...")
+    for r in top:
+        data = get(f"{BASE}/activity", params={"user": r["wallet"], "limit": 5})
+        name = ""
+        if data and isinstance(data, list):
+            for a in data:
+                name = a.get("name") or a.get("pseudonym") or ""
+                if name:
+                    break
+        r["username"] = name
+        time.sleep(0.1)
+
+    total_events = len(winning_markets)
+    hdr = f"{'#':<4} {'Username':<24} {'Wallet':<44} {'Correct':>8} {'/ Total':>8}"
     print("\n" + "=" * len(hdr))
     print(hdr)
     print("-" * len(hdr))
     for i, r in enumerate(top, 1):
-        name = (r["username"] or r["wallet"][:10] + "…")[:21]
-        wl = f"{r['wins']}/{r['losses']}"
-        print(
-            f"{i:<4} {name:<22} {r['wallet']:<44} {r['weather_markets']:>4} "
-            f"{wl:>7} {r['win_rate']:>4.0f}% {r['net_pnl']:>+10.2f} {r['roi_pct']:>+6.1f}%"
-        )
+        name = (r["username"] or r["wallet"][:12] + "…")[:23]
+        print(f"{i:<4} {name:<24} {r['wallet']:<44} {r['correct']:>8} {'/ ' + str(total_events):>8}")
     print("=" * len(hdr))
 
-    print("\nProfile links:")
-    for r in top[:8]:
-        name = r["username"] or r["wallet"][:14] + "…"
-        print(f"  {name:<28}  {r['url']}")
+    print(f"\nPolymarket profiles (top {min(10, len(top))}):")
+    for r in top[:10]:
+        name = r["username"] or r["wallet"][:16] + "…"
+        print(f"  {name:<30}  {r['url']}  ({r['correct']}/{total_events} correct)")
 
     return top
 
